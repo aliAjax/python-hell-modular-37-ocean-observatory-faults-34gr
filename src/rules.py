@@ -1,6 +1,51 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+
+
+# Default ordering for reconciliation sources. Lower number wins when two
+# observations arrive with the same observed_at. Unknown sources share the
+# middle tier; only an explicit priority breaks ties.
+DEFAULT_SOURCE_PRIORITY = {
+    "shore": 0,
+    "station": 10,
+    "field": 20,
+}
+
+# Record types an offline watchkeeper is allowed to upload per role.
+OFFLINE_RECORD_ROLES = {
+    "telemetry_revision": ("admin", "operator", "engineer", "field"),
+    "incident": ("admin", "operator", "engineer", "field"),
+    "incident_action": ("admin", "operator", "engineer", "field"),
+    "gap": ("admin", "operator", "engineer", "field"),
+}
+
+# Incident lifecycle actions allowed inside an offline batch, mapped to the
+# roles that may drive that stage.
+INCIDENT_ACTION_ROLES = {
+    "diagnose": ("admin", "operator", "engineer"),
+    "plan_recovery": ("admin", "operator", "engineer"),
+    "start_recovery": ("admin", "operator", "engineer"),
+    "resolve": ("admin", "engineer"),
+    "close": ("admin", "engineer"),
+    "reopen": ("admin", "engineer", "operator"),
+}
+
+
+def parse_observed_at(value):
+    """Parse the ISO-8601 observation timestamp used for ordering revisions."""
+    if not value:
+        raise ValidationError("observed_at is required")
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValidationError("observed_at must be ISO-8601: " + str(value))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _require(data, fields):
@@ -112,7 +157,32 @@ def _revise_telemetry(actor, entity, data, lookup):
     return {"late_revision": True, "revised_by": actor.user_id}
 
 
+def _pending_conflicts(lookup, entity):
+    """Pending reconciliation conflicts tied to the incident or its asset."""
+    conflicts = []
+    for item in _all(lookup, "reconciliation_conflict"):
+        if item["status"] != "pending":
+            continue
+        data = item["data"]
+        if data.get("incident_id") == entity["id"]:
+            conflicts.append(item)
+        elif data.get("asset_id") and data.get("asset_id") == entity["data"].get("asset_id"):
+            conflicts.append(item)
+    return conflicts
+
+
+def _require_no_pending_conflict(lookup, entity, action):
+    conflicts = _pending_conflicts(lookup, entity)
+    if conflicts:
+        ids = ", ".join(item["id"] for item in conflicts[:5])
+        raise ConflictError(
+            "incident cannot %s while %s reconciliation conflict(s) are pending: %s"
+            % (action, len(conflicts), ids)
+        )
+
+
 def _resolve_incident(actor, entity, data, lookup):
+    _require_no_pending_conflict(lookup, entity, "resolve")
     actions = [a for a in _all(lookup, "recovery_action") if a["data"].get("incident_id") == entity["id"] and a["status"] not in ("succeeded", "failed", "cancelled")]
     if actions:
         raise ConflictError("incident cannot resolve while recovery actions are active")
@@ -123,6 +193,11 @@ def _resolve_incident(actor, entity, data, lookup):
     if entity["data"].get("asset_id") and any(a["id"] == entity["data"].get("asset_id") for a in assets):
         raise ConflictError("affected asset is still unavailable")
     return {"resolved_by": actor.user_id}
+
+
+def _close_incident(actor, entity, data, lookup):
+    _require_no_pending_conflict(lookup, entity, "close")
+    return {"closed_by": actor.user_id}
 
 
 def _complete_action(actor, entity, data, lookup):
@@ -138,14 +213,24 @@ def _complete_mission(actor, entity, data, lookup):
 
 
 class RuleEngine:
+    def __init__(self, source_priority=None):
+        # Explicit source tiers override the defaults; merged so tests/ops can
+        # rank site-specific origins without restating everything.
+        self.source_priority = dict(DEFAULT_SOURCE_PRIORITY)
+        if source_priority:
+            self.source_priority.update(source_priority)
+
     ALIASES = {
         "stations": "station", "assets": "asset", "links": "link", "telemetries": "telemetry",
         "incidents": "incident", "recovery_actions": "recovery_action", "missions": "mission",
-        "gaps": "gap",
+        "gaps": "gap", "offline_records": "offline_record",
+        "reconciliation_conflicts": "reconciliation_conflict", "conflicts": "reconciliation_conflict",
     }
     INITIAL_STATUS = {
         "station": "online", "asset": "healthy", "link": "up", "telemetry": "current",
         "incident": "open", "recovery_action": "proposed", "mission": "planned", "gap": "open",
+        "offline_record": "recorded",
+        "reconciliation_conflict": "pending",
     }
     TRANSITIONS = {
         "station": {
@@ -197,6 +282,12 @@ class RuleEngine:
             "estimate": (("open",), "estimated"),
             "fill": (("estimated",), "filled"),
             "accept": (("filled", "open"), "accepted"),
+        },
+        "offline_record": {
+            "reject": (("recorded",), "rejected"),
+        },
+        "reconciliation_conflict": {
+            "resolve": (("pending",), "resolved"),
         },
     }
     CREATE_REQUIRED = {
@@ -268,9 +359,31 @@ class RuleEngine:
     CUSTOM_TRANSITIONS = {
         ("telemetry", "revise"): _revise_telemetry,
         ("incident", "resolve"): _resolve_incident,
+        ("incident", "close"): _close_incident,
         ("recovery_action", "succeed"): _complete_action,
         ("mission", "complete"): _complete_mission,
     }
+
+    def source_rank(self, source_id):
+        """Ordering tier of a source; unknown sources share the middle tier."""
+        if source_id in self.source_priority:
+            return self.source_priority[source_id], True
+        return 50, False
+
+    def check_offline_role(self, actor, record_type, action=None):
+        """Reject an offline record when its uploader lacks authority for it."""
+        if actor.role not in OFFLINE_RECORD_ROLES.get(record_type, ("admin",)):
+            raise PermissionDenied(
+                "role %s is not allowed to submit offline %s records" % (actor.role, record_type)
+            )
+        if action and actor.role not in INCIDENT_ACTION_ROLES.get(action, ("admin",)):
+            raise PermissionDenied(
+                "role %s is not allowed to drive incident action %s offline" % (actor.role, action)
+            )
+
+    def check_no_pending_conflicts(self, entity, lookup, action="close"):
+        """Block incident lifecycle while related conflicts are unhandled."""
+        _require_no_pending_conflict(lookup, entity, action)
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
