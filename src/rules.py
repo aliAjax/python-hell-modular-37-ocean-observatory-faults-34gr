@@ -122,7 +122,26 @@ def _resolve_incident(actor, entity, data, lookup):
     assets = [a for a in _all(lookup, "asset") if a["status"] in ("faulty", "offline", "rebooting")]
     if entity["data"].get("asset_id") and any(a["id"] == entity["data"].get("asset_id") for a in assets):
         raise ConflictError("affected asset is still unavailable")
+    if _pending_conflicts(lookup, entity):
+        raise ConflictError("incident cannot resolve while conflicts are pending")
     return {"resolved_by": actor.user_id}
+
+
+def _close_incident(actor, entity, data, lookup):
+    if _pending_conflicts(lookup, entity):
+        raise ConflictError("incident cannot close while conflicts are pending")
+    return {"closed_by": actor.user_id}
+
+
+def _pending_conflicts(lookup, incident):
+    asset_id = incident["data"].get("asset_id")
+    return [
+        item for item in _all(lookup, "conflict")
+        if item["status"] == "open" and (
+            item["data"].get("incident_id") == incident["id"]
+            or (asset_id and item["data"].get("asset_id") == asset_id)
+        )
+    ]
 
 
 def _complete_action(actor, entity, data, lookup):
@@ -146,6 +165,7 @@ class RuleEngine:
     INITIAL_STATUS = {
         "station": "online", "asset": "healthy", "link": "up", "telemetry": "current",
         "incident": "open", "recovery_action": "proposed", "mission": "planned", "gap": "open",
+        "conflict": "open",
     }
     TRANSITIONS = {
         "station": {
@@ -197,6 +217,9 @@ class RuleEngine:
             "estimate": (("open",), "estimated"),
             "fill": (("estimated",), "filled"),
             "accept": (("filled", "open"), "accepted"),
+        },
+        "conflict": {
+            "resolve": (("open",), "resolved"),
         },
     }
     CREATE_REQUIRED = {
@@ -255,6 +278,7 @@ class RuleEngine:
         "estimate": ("admin", "engineer", "operator"),
         "fill": ("admin", "engineer", "operator"),
         "accept": ("admin", "engineer", "operator"),
+        "resolve": ("admin", "engineer"),
     }
     CUSTOM_CREATE = {
         "asset": lambda a, d, l: _validate_asset(d, l),
@@ -268,12 +292,18 @@ class RuleEngine:
     CUSTOM_TRANSITIONS = {
         ("telemetry", "revise"): _revise_telemetry,
         ("incident", "resolve"): _resolve_incident,
+        ("incident", "close"): _close_incident,
         ("recovery_action", "succeed"): _complete_action,
         ("mission", "complete"): _complete_mission,
     }
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
+
+    def check_create_role(self, actor, kind):
+        """Raise PermissionDenied if the actor may not create entities of this kind."""
+        kind = self.normalize_kind(kind)
+        _ensure_role(actor, self.CREATE_ROLES.get(kind, ("admin",)))
 
     def initial_status(self, kind, data=None):
         kind = self.normalize_kind(kind)
